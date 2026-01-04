@@ -216,7 +216,7 @@ func (a *App) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		if match != nil && len(match) > 1 {
 			statusCode = http.StatusPartialContent
 			fromByte, _ = strconv.ParseInt(match[1], 10, 64)
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", fromByte, meta.Size-1, meta.Size-fromByte))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", fromByte, meta.Size-1, meta.Size))
 		}
 	}
 

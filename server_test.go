@@ -269,6 +269,13 @@ func TestDownloadWithRange(t *testing.T) {
 		t.Fatalf("expected status 206, got %d", resp.StatusCode)
 	}
 
+	// Verify Content-Range header format: bytes start-end/total
+	contentRange := resp.Header.Get("Content-Range")
+	expectedRange := fmt.Sprintf("bytes 5-%d/%d", testContentSize-1, testContentSize)
+	if contentRange != expectedRange {
+		t.Errorf("expected Content-Range %q, got %q", expectedRange, contentRange)
+	}
+
 	content, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read error: %s", err)
