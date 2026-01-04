@@ -1,18 +1,15 @@
-package main
+package lfsd
 
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 )
 
 const (
 	contentMediaType = "application/vnd.git-lfs"
-	metaMediaType    = "application/vnd.git-lfs+json"
+	metaMediaType    = contentMediaType + "+json"
 )
 
 // BatchRequest represents a batch API request.
@@ -77,24 +74,22 @@ type VerifyRequest struct {
 	Size int64  `json:"size"`
 }
 
-// App is the LFS server application.
-type App struct {
-	config       *Config
+// Server is the LFS server application.
+type Server struct {
+	host         string
 	contentStore *ContentStore
-	metaStore    *MetaStore
 }
 
-// NewApp creates a new App.
-func NewApp(config *Config, content *ContentStore, meta *MetaStore) *App {
-	return &App{
-		config:       config,
+// NewServer creates a new App.
+func NewServer(host string, content *ContentStore) *Server {
+	return &Server{
+		host:         host,
 		contentStore: content,
-		metaStore:    meta,
 	}
 }
 
 // ServeHTTP implements http.Handler.
-func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (a *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	// Route requests
@@ -113,7 +108,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // batchHandler handles the batch API.
-func (a *App) batchHandler(w http.ResponseWriter, r *http.Request) {
+func (a *Server) batchHandler(w http.ResponseWriter, r *http.Request) {
 	// Validate content type
 	if !isLFSMediaType(r.Header.Get("Accept")) && !isLFSMediaType(r.Header.Get("Content-Type")) {
 		a.writeError(w, http.StatusNotAcceptable, "Invalid media type")
@@ -136,9 +131,7 @@ func (a *App) batchHandler(w http.ResponseWriter, r *http.Request) {
 
 		switch req.Operation {
 		case "download":
-			// Check if object exists in meta store and content store
-			_, err := a.metaStore.Get(obj.Oid)
-			if err != nil || !a.contentStore.Exists(obj.Oid) {
+			if !a.contentStore.Exists(obj.Oid) {
 				resp.Error = &ObjectError{
 					Code:    404,
 					Message: "Object not found",
@@ -153,14 +146,10 @@ func (a *App) batchHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case "upload":
-			// Check if object already exists
-			_, err := a.metaStore.Get(obj.Oid)
-			if err == nil && a.contentStore.Exists(obj.Oid) {
+			if a.contentStore.Exists(obj.Oid) {
 				// Object already exists, no action needed
 				resp.Authenticated = true
 			} else {
-				// Store metadata and return upload URL
-				a.metaStore.Put(obj.Oid, obj.Size)
 				resp.Actions = map[string]*Link{
 					"upload": {
 						Href:      a.objectURL(obj.Oid),
@@ -194,108 +183,56 @@ func (a *App) batchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // downloadHandler handles object downloads.
-func (a *App) downloadHandler(w http.ResponseWriter, r *http.Request) {
+func (a *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	oid := extractOID(r.URL.Path)
 	if oid == "" {
 		a.writeError(w, http.StatusBadRequest, "Invalid OID")
 		return
 	}
 
-	meta, err := a.metaStore.Get(oid)
-	if err != nil {
-		a.writeError(w, http.StatusNotFound, "Object not found")
-		return
-	}
-
-	// Support resume download using Range header
-	var fromByte int64
-	statusCode := http.StatusOK
-	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
-		regex := regexp.MustCompile(`bytes=(\d+)\-.*`)
-		match := regex.FindStringSubmatch(rangeHdr)
-		if match != nil && len(match) > 1 {
-			statusCode = http.StatusPartialContent
-			fromByte, _ = strconv.ParseInt(match[1], 10, 64)
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", fromByte, meta.Size-1, meta.Size))
-		}
-	}
-
-	content, err := a.contentStore.Get(oid, fromByte)
-	if err != nil {
-		a.writeError(w, http.StatusNotFound, "Object not found")
-		return
-	}
-	defer content.Close()
-
-	w.Header().Set("Content-Type", "application/octet-stream")
-	if r.Method == "HEAD" {
-		w.Header().Set("Content-Length", strconv.FormatInt(meta.Size-fromByte, 10))
-		w.WriteHeader(statusCode)
-		return
-	}
-
-	w.WriteHeader(statusCode)
-	io.Copy(w, content)
+	a.contentStore.Download(w, r, oid)
 }
 
 // uploadHandler handles object uploads.
-func (a *App) uploadHandler(w http.ResponseWriter, r *http.Request) {
+func (a *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	oid := extractOID(r.URL.Path)
 	if oid == "" {
 		a.writeError(w, http.StatusBadRequest, "Invalid OID")
 		return
 	}
 
-	meta, err := a.metaStore.Get(oid)
-	if err != nil {
-		a.writeError(w, http.StatusNotFound, "Object not found in metadata")
-		return
-	}
-
-	if err := a.contentStore.Put(oid, meta.Size, r.Body); err != nil {
-		a.metaStore.Delete(oid)
-		a.writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
+	a.contentStore.Upload(w, r, oid)
 }
 
 // verifyHandler handles verify callbacks.
-func (a *App) verifyHandler(w http.ResponseWriter, r *http.Request) {
+func (a *Server) verifyHandler(w http.ResponseWriter, r *http.Request) {
+	oid := extractOID(r.URL.Path)
+	if oid == "" {
+		a.writeError(w, http.StatusBadRequest, "Invalid OID")
+		return
+	}
+
 	var req VerifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		a.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Verify that the object exists and has correct size
-	if !a.contentStore.Exists(req.Oid) {
-		a.writeError(w, http.StatusNotFound, "Object not found")
-		return
-	}
-
-	size, err := a.contentStore.Size(req.Oid)
-	if err != nil || size != req.Size {
-		a.writeError(w, http.StatusBadRequest, "Size mismatch")
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
+	a.contentStore.Verify(w, r, oid, req.Size)
 }
 
 // objectURL returns the URL for an object.
-func (a *App) objectURL(oid string) string {
-	return fmt.Sprintf("%s/objects/%s", a.config.ExternalURL(), oid)
+func (a *Server) objectURL(oid string) string {
+	return fmt.Sprintf("%s/objects/%s", a.host, oid)
 }
 
 // verifyURL returns the verify URL for an object.
-func (a *App) verifyURL(oid string) string {
-	return fmt.Sprintf("%s/verify/%s", a.config.ExternalURL(), oid)
+func (a *Server) verifyURL(oid string) string {
+	return fmt.Sprintf("%s/verify/%s", a.host, oid)
 }
 
 // writeError writes an error response.
-func (a *App) writeError(w http.ResponseWriter, status int, message string) {
+func (a *Server) writeError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", metaMediaType)
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(&ErrorResponse{Message: message})
